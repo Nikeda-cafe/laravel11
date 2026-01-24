@@ -81,6 +81,89 @@ docker compose run --rm app ./vendor/bin/phpstan analyse
 3. PHPStan (Larastan)
 4. Pest
 
+## AWS ECS へのデプロイ
+
+このプロジェクトは AWS ECS (Fargate) で実行できるように設定されています。
+
+### 前提条件
+
+- AWS CLI がインストールされ、設定されていること
+- Docker がインストールされていること
+- ECR へのアクセス権限があること
+
+### デプロイ手順
+
+#### 1. 環境変数の設定
+
+`ecs-task-definition.json` を編集して、以下の値を設定してください：
+
+- `YOUR_ACCOUNT_ID`: AWSアカウントID
+- `YOUR_REGION`: AWSリージョン（例: `ap-northeast-1`）
+- IAMロールARN（`executionRoleArn`, `taskRoleArn`）
+- Secrets ManagerのARN（環境変数やシークレット）
+
+#### 2. ECRへのイメージプッシュ
+
+```bash
+# 環境変数を設定（オプション）
+export AWS_REGION=ap-northeast-1
+export AWS_ACCOUNT_ID=123456789012
+export IMAGE_TAG=latest
+
+# ECRへのプッシュ
+./scripts/push-to-ecr.sh
+```
+
+このスクリプトは以下を実行します：
+- ECRリポジトリの作成（存在しない場合）
+- Laravelイメージのビルドとプッシュ
+- nginxイメージのビルドとプッシュ
+
+#### 3. ECSクラスターとサービスの作成
+
+初回デプロイ時は、AWSコンソールまたはAWS CLIで以下を作成する必要があります：
+
+1. **ECSクラスターの作成**
+   ```bash
+   aws ecs create-cluster --cluster-name laravel-cluster --region ap-northeast-1
+   ```
+
+2. **CloudWatch Logsグループの作成**
+   ```bash
+   aws logs create-log-group --log-group-name /ecs/laravel-app --region ap-northeast-1
+   ```
+
+3. **ECSサービスの作成**
+   - VPC、サブネット、セキュリティグループを設定
+   - ロードバランサー（ALB）を設定（オプション）
+
+#### 4. タスク定義の登録とデプロイ
+
+```bash
+# 環境変数を設定
+export AWS_REGION=ap-northeast-1
+export CLUSTER_NAME=laravel-cluster
+export SERVICE_NAME=laravel-service
+
+# デプロイ
+./scripts/deploy-ecs.sh
+```
+
+### ファイル構成
+
+- `Dockerfile`: Laravelコンテナ用（マルチステージビルド）
+- `Dockerfile.nginx`: nginxコンテナ用
+- `ecs-task-definition.json`: ECSタスク定義
+- `docker/nginx/ecs.conf`: ECS用nginx設定
+- `scripts/push-to-ecr.sh`: ECRへのプッシュスクリプト
+- `scripts/deploy-ecs.sh`: ECSデプロイスクリプト
+
+### 注意事項
+
+- 環境変数（`APP_KEY`、DB接続情報など）は Secrets Manager で管理することを推奨します
+- ストレージ（`storage`、`bootstrap/cache`）の永続化が必要な場合は EFS を使用してください
+- セキュリティグループで nginx コンテナの 80 番ポートのみ公開してください
+
 ## その他
 
 - `.env.testing` は in-memory SQLite を使うため、CI/ローカルテストも DB サーバー不要です。
