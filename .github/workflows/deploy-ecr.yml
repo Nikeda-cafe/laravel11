@@ -197,6 +197,30 @@ jobs:
           echo "task_definition_arn=$NEW_TD_ARN" >> "$GITHUB_OUTPUT"
           echo "Registered: $NEW_TD_ARN"
 
+      - name: Preflight: ensure ECS service is ACTIVE
+        run: |
+          set -euo pipefail
+
+          STATUS="$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].status' \
+            --output text)"
+
+          DESIRED_STATUS="$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].desiredStatus' \
+            --output text)"
+
+          echo "ECS service status: $STATUS (desiredStatus: $DESIRED_STATUS)"
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "ERROR: ECS service is not ACTIVE. UpdateService is not allowed."
+            echo "Hint: if the service is DRAINING/INACTIVE, cancel deletion or recreate the service."
+            exit 1
+          fi
+
       - name: Update ECS service (rolling deployment)
         run: |
           set -euo pipefail
