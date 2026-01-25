@@ -101,52 +101,40 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Resolve pushed image digests (pin by digest)
-        id: image-digests
+      - name: Build image URIs (use tag)
+        id: image-uris
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
         run: |
           set -euo pipefail
 
-          APP_DIGEST="$(aws ecr describe-images \
-            --repository-name "${{ env.ECR_REPOSITORY_APP }}" \
-            --image-ids imageTag="$IMAGE_TAG" \
-            --query 'imageDetails[0].imageDigest' \
-            --output text)"
+          APP_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_APP }}:$IMAGE_TAG"
+          NGINX_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG"
 
-          NGINX_DIGEST="$(aws ecr describe-images \
-            --repository-name "${{ env.ECR_REPOSITORY_NGINX }}" \
-            --image-ids imageTag="$IMAGE_TAG" \
-            --query 'imageDetails[0].imageDigest' \
-            --output text)"
-
-          if [ -z "$APP_DIGEST" ] || [ "$APP_DIGEST" = "None" ]; then
-            echo "ERROR: Could not resolve app image digest for tag=$IMAGE_TAG"
-            exit 1
-          fi
-          if [ -z "$NGINX_DIGEST" ] || [ "$NGINX_DIGEST" = "None" ]; then
-            echo "ERROR: Could not resolve nginx image digest for tag=$IMAGE_TAG"
-            exit 1
-          fi
-
-          APP_URI_DIGEST="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_APP }}@$APP_DIGEST"
-          NGINX_URI_DIGEST="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_NGINX }}@$NGINX_DIGEST"
-
-          echo "app_image=$APP_URI_DIGEST" >> "$GITHUB_OUTPUT"
-          echo "nginx_image=$NGINX_URI_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "app_image=$APP_URI_TAG" >> "$GITHUB_OUTPUT"
+          echo "nginx_image=$NGINX_URI_TAG" >> "$GITHUB_OUTPUT"
           echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
 
-          echo "Pinned images:"
-          echo "  app:   $APP_URI_DIGEST"
-          echo "  nginx: $NGINX_URI_DIGEST"
+          echo "Images (tag):"
+          echo "  app:   $APP_URI_TAG"
+          echo "  nginx: $NGINX_URI_TAG"
 
-      - name: Fetch current ECS task definition
-        id: task-def
+      - name: Fetch current ECS task definition (from service)
+        id: task-definition
         run: |
           set -euo pipefail
+
+          CURRENT_TD_ARN="$(aws ecs describe-services \
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}" \
+            --query 'services[0].taskDefinition' \
+            --output text)"
+
+          echo "Current service task definition: $CURRENT_TD_ARN"
+
           aws ecs describe-task-definition \
-            --task-definition "${{ env.ECS_TASK_DEFINITION_FAMILY }}" \
+            --task-definition "$CURRENT_TD_ARN" \
             --query 'taskDefinition' \
             --output json > task-definition.json
 
@@ -155,8 +143,8 @@ jobs:
 
       - name: Create updated task definition (replace container images)
         env:
-          APP_IMAGE: ${{ steps.image-digests.outputs.app_image }}
-          NGINX_IMAGE: ${{ steps.image-digests.outputs.nginx_image }}
+          APP_IMAGE: ${{ steps.image-uris.outputs.app_image }}
+          NGINX_IMAGE: ${{ steps.image-uris.outputs.nginx_image }}
         run: |
           set -euo pipefail
 
@@ -228,7 +216,7 @@ jobs:
       - name: Summary
         run: |
           echo "Deployment completed."
-          echo "  tag:  ${{ steps.image-digests.outputs.image_tag }}"
-          echo "  app:  ${{ steps.image-digests.outputs.app_image }}"
-          echo "  nginx:${{ steps.image-digests.outputs.nginx_image }}"
+          echo "  tag:  ${{ steps.image-uris.outputs.image_tag }}"
+          echo "  app:  ${{ steps.image-uris.outputs.app_image }}"
+          echo "  nginx:${{ steps.image-uris.outputs.nginx_image }}"
           echo "  task: ${{ steps.register.outputs.task_definition_arn }}"
