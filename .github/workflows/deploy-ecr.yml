@@ -80,7 +80,7 @@ jobs:
           set -euo pipefail
           APP_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_APP }}:$IMAGE_TAG"
           echo "Building: $APP_URI_TAG"
-          docker build -t "$APP_URI_TAG" -f Dockerfile .
+          docker build --platform linux/amd64 -t "$APP_URI_TAG" -f Dockerfile .
           echo "Pushing: $APP_URI_TAG"
           docker push "$APP_URI_TAG"
 
@@ -92,14 +92,9 @@ jobs:
           set -euo pipefail
           NGINX_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG"
           echo "Building: $NGINX_URI_TAG"
-          docker build -t "$NGINX_URI_TAG" -f Dockerfile.nginx .
+          docker build --platform linux/amd64 -t "$NGINX_URI_TAG" -f Dockerfile.nginx .
           echo "Pushing: $NGINX_URI_TAG"
           docker push "$NGINX_URI_TAG"
-
-      - name: Install jq
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y jq
 
       - name: Build image URIs (use tag)
         id: image-uris
@@ -120,57 +115,39 @@ jobs:
           echo "  app:   $APP_URI_TAG"
           echo "  nginx: $NGINX_URI_TAG"
 
-      - name: Fetch current ECS task definition (from service)
-        id: task-definition
+      - name: Install jq
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Fetch current task definition from service
+        id: current-td
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
         run: |
           set -euo pipefail
 
-          CURRENT_TD_ARN="$(aws ecs describe-services \
+          SERVICE_JSON="$(aws ecs describe-services \
             --cluster "${{ env.ECS_CLUSTER }}" \
             --services "${{ env.ECS_SERVICE }}" \
-            --query 'services[0].taskDefinition' \
-            --output text)"
+            --output json)"
 
+          STATUS="$(echo "$SERVICE_JSON" | jq -r '.services[0].status')"
+          DESIRED_STATUS="$(echo "$SERVICE_JSON" | jq -r '.services[0].desiredStatus')"
+          CURRENT_TD_ARN="$(echo "$SERVICE_JSON" | jq -r '.services[0].taskDefinition')"
+
+          echo "Service status: $STATUS (desiredStatus: $DESIRED_STATUS)"
           echo "Current service task definition: $CURRENT_TD_ARN"
+
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "ERROR: ECS service is not ACTIVE. Cannot deploy."
+            exit 1
+          fi
 
           aws ecs describe-task-definition \
             --task-definition "$CURRENT_TD_ARN" \
             --query 'taskDefinition' \
             --output json > task-definition.json
-
-          echo "Current task definition images:"
-          jq '.containerDefinitions[] | {name: .name, image: .image}' task-definition.json
-
-      - name: Create updated task definition (replace container images)
-        env:
-          APP_IMAGE: ${{ steps.image-uris.outputs.app_image }}
-          NGINX_IMAGE: ${{ steps.image-uris.outputs.nginx_image }}
-        run: |
-          set -euo pipefail
-
-          # コンテナ名が存在することを検証（名前不一致だと更新されないため）
-          APP_EXISTS="$(jq --arg n "${{ env.ECS_CONTAINER_NAME_APP }}" '[.containerDefinitions[].name] | index($n)' task-definition.json)"
-          NGINX_EXISTS="$(jq --arg n "${{ env.ECS_CONTAINER_NAME_NGINX }}" '[.containerDefinitions[].name] | index($n)' task-definition.json)"
-
-          if [ "$APP_EXISTS" = "null" ]; then
-            echo "ERROR: container name not found in task definition: ${{ env.ECS_CONTAINER_NAME_APP }}"
-            jq '.containerDefinitions[] | .name' task-definition.json
-            exit 1
-          fi
-          if [ "$NGINX_EXISTS" = "null" ]; then
-            echo "ERROR: container name not found in task definition: ${{ env.ECS_CONTAINER_NAME_NGINX }}"
-            jq '.containerDefinitions[] | .name' task-definition.json
-            exit 1
-          fi
-
-          jq --arg appName "${{ env.ECS_CONTAINER_NAME_APP }}" --arg appImg "$APP_IMAGE" \
-             --arg nginxName "${{ env.ECS_CONTAINER_NAME_NGINX }}" --arg nginxImg "$NGINX_IMAGE" \
-             '.containerDefinitions |= map(
-                if .name == $appName then .image = $appImg
-                elif .name == $nginxName then .image = $nginxImg
-                else .
-                end
-              )' task-definition.json > task-definition-updated.json
 
           # register-task-definition で不要な読み取り専用フィールドを削除
           jq 'del(
@@ -178,40 +155,42 @@ jobs:
                 .revision,
                 .status,
                 .requiresAttributes,
+                .placementConstraints,
                 .compatibilities,
                 .registeredAt,
                 .registeredBy
-              )' task-definition-updated.json > task-definition-clean.json
+              )' task-definition.json > task-definition-clean.json
 
-          echo "Updated task definition images:"
-          jq '.containerDefinitions[] | {name: .name, image: .image}' task-definition-clean.json
+          echo "Current task definition images:"
+          jq '.containerDefinitions[] | {name: .name, image: .image}' task-definition.json
 
-      - name: Register new task definition
-        id: register
-        run: |
-          set -euo pipefail
-          NEW_TD_ARN="$(aws ecs register-task-definition \
-            --cli-input-json file://task-definition-clean.json \
-            --query 'taskDefinition.taskDefinitionArn' \
-            --output text)"
-          echo "task_definition_arn=$NEW_TD_ARN" >> "$GITHUB_OUTPUT"
-          echo "Registered: $NEW_TD_ARN"
+      - name: Render task definition (app)
+        id: render-app
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition-clean.json
+          container-name: ${{ env.ECS_CONTAINER_NAME_APP }}
+          image: ${{ steps.image-uris.outputs.app_image }}
 
-      - name: Update ECS service (rolling deployment)
-        run: |
-          set -euo pipefail
-          aws ecs update-service \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --service "${{ env.ECS_SERVICE }}" \
-            --task-definition "${{ steps.register.outputs.task_definition_arn }}" \
-            --force-new-deployment
+      - name: Render task definition (nginx)
+        id: render-nginx
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ steps.render-app.outputs.task-definition }}
+          container-name: ${{ env.ECS_CONTAINER_NAME_NGINX }}
+          image: ${{ steps.image-uris.outputs.nginx_image }}
 
-      - name: Wait for service stable
-        run: |
-          set -euo pipefail
-          aws ecs wait services-stable \
-            --cluster "${{ env.ECS_CLUSTER }}" \
-            --services "${{ env.ECS_SERVICE }}"
+      - name: Deploy ECS task definition (rolling)
+        id: deploy
+        if: github.event_name == 'workflow_dispatch' || (github.ref == 'refs/heads/main' && github.event_name == 'push')
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render-nginx.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
 
       - name: Summary
         run: |
@@ -219,4 +198,4 @@ jobs:
           echo "  tag:  ${{ steps.image-uris.outputs.image_tag }}"
           echo "  app:  ${{ steps.image-uris.outputs.app_image }}"
           echo "  nginx:${{ steps.image-uris.outputs.nginx_image }}"
-          echo "  task: ${{ steps.register.outputs.task_definition_arn }}"
+          echo "  task: ${{ steps.deploy.outputs.task-definition-arn }}"
