@@ -151,11 +151,11 @@ aws iam create-role \
 
 **1-3. IAMポリシーのアタッチ**
 
-ECRへのアクセス権限を持つポリシーをアタッチします：
+ECRとECSへのアクセス権限を持つポリシーをアタッチします：
 
 ```bash
-# ポリシードキュメント（ecr-policy.json）
-cat > ecr-policy.json <<EOF
+# ポリシードキュメント（deploy-policy.json）
+cat > deploy-policy.json <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
@@ -174,6 +174,30 @@ cat > ecr-policy.json <<EOF
         "ecr:CreateRepository"
       ],
       "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecs:DescribeTaskDefinition",
+        "ecs:RegisterTaskDefinition",
+        "ecs:UpdateService",
+        "ecs:DescribeServices",
+        "ecs:ListTasks",
+        "ecs:DescribeTasks"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Effect": "Allow",
+      "Action": [
+        "iam:PassRole"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "iam:PassedToService": "ecs-tasks.amazonaws.com"
+        }
+      }
     }
   ]
 }
@@ -182,8 +206,8 @@ EOF
 # ポリシーの作成とアタッチ
 aws iam put-role-policy \
   --role-name GitHubActionsECRRole \
-  --policy-name ECRPushPolicy \
-  --policy-document file://ecr-policy.json \
+  --policy-name ECRECSPushPolicy \
+  --policy-document file://deploy-policy.json \
   --region ap-northeast-1
 ```
 
@@ -203,12 +227,23 @@ GitHubリポジトリの **Settings → Secrets and variables → Actions** で�
 
 #### ワークフローの動作
 
-- **全ブランチ**: Git hashのshort形式（7文字、例: `a1b2c3d`）をタグとしてECRへpush
+- **全ブランチ**: Git hashのshort形式（7文字、例: `a1b2c3d`）をタグとしてECRへpushし、ECSサービスをローリングアップデート
 - **手動実行**: GitHub ActionsのUIから任意のタグを指定可能（未指定の場合はGit hashのshort形式を使用）
 
-ECRリポジトリ名は以下の通りです（`.github/workflows/deploy-ecr.yml` の `env` セクションで変更可能）：
+**デプロイフロー**:
+1. ECRへイメージをビルド・プッシュ（Laravelアプリとnginx）
+2. 既存のECSタスク定義を取得
+3. 新しいイメージURIでタスク定義を更新
+4. 新しいタスク定義を登録
+5. ECSサービスを更新してローリングデプロイを実行
+6. サービスが安定するまで待機
+
+ECRリポジトリ名とECS設定は以下の通りです（`.github/workflows/deploy-ecr.yml` の `env` セクションで変更可能）：
 - Laravelアプリ: `laravel-app`
 - nginx: `laravel-nginx`
+- ECSクラスター: `laravel-cluster`
+- ECSサービス: `laravel-service`
+- タスク定義ファミリー: `laravel-task`
 
 ### 手動デプロイ手順
 

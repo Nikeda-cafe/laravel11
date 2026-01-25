@@ -1,4 +1,4 @@
-name: Deploy to ECR
+name: Deploy to ECR and ECS
 
 on:
   push:
@@ -10,12 +10,18 @@ on:
       - 'Dockerfile.nginx'
       - 'docker/**'
       - '.github/workflows/deploy-ecr.yml'
+      - 'app/**'
+      - 'config/**'
+      - 'routes/**'
   workflow_dispatch:
 
 env:
   AWS_REGION: ap-northeast-1
   ECR_REPOSITORY_APP: laravel-app
   ECR_REPOSITORY_NGINX: laravel-nginx
+  ECS_CLUSTER: ecs-laravel-cluster
+  ECS_SERVICE: ecs-laravel-service
+  ECS_TASK_DEFINITION_FAMILY: ecs-laravel-task-definition
 
 jobs:
   build-and-push:
@@ -77,6 +83,113 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
 
       - name: Output image URIs
+        id: image-uris
         run: |
-          echo "Laravel app image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_APP }}:${{ steps.image-tag.outputs.tag }}"
-          echo "Nginx image: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NGINX }}:${{ steps.image-tag.outputs.tag }}"
+          APP_IMG="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_APP }}:${{ steps.image-tag.outputs.tag }}"
+          NGINX_IMG="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NGINX }}:${{ steps.image-tag.outputs.tag }}"
+          echo "Laravel app image: $APP_IMG"
+          echo "Nginx image: $NGINX_IMG"
+          echo "app_image=$APP_IMG" >> $GITHUB_OUTPUT
+          echo "nginx_image=$NGINX_IMG" >> $GITHUB_OUTPUT
+          echo "image_tag=${{ steps.image-tag.outputs.tag }}" >> $GITHUB_OUTPUT
+
+    outputs:
+      app_image: ${{ steps.image-uris.outputs.app_image }}
+      nginx_image: ${{ steps.image-uris.outputs.nginx_image }}
+      image_tag: ${{ steps.image-uris.outputs.image_tag }}
+
+  deploy-ecs:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq
+
+      - name: Get latest task definition
+        id: task-def
+        run: |
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_TASK_DEFINITION_FAMILY }} \
+            --query 'taskDefinition' \
+            --region ${{ env.AWS_REGION }} || echo "{}")
+          echo "task_def<<EOF" >> $GITHUB_OUTPUT
+          echo "$TASK_DEF" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Update task definition with new images
+        id: update-task-def
+        env:
+          APP_IMAGE: ${{ needs.build-and-push.outputs.app_image }}
+          NGINX_IMAGE: ${{ needs.build-and-push.outputs.nginx_image }}
+        run: |
+          # タスク定義をJSONファイルに保存
+          echo '${{ steps.task-def.outputs.task_def }}' > task-definition.json
+
+          # jqを使ってイメージURIを更新
+          # appコンテナのイメージを更新
+          jq --arg img "$APP_IMAGE" \
+            '.containerDefinitions[] |= if .name == "app" then .image = $img else . end' \
+            task-definition.json > task-definition-updated.json
+
+          # nginxコンテナのイメージを更新
+          jq --arg img "$NGINX_IMAGE" \
+            '.containerDefinitions[] |= if .name == "nginx" then .image = $img else . end' \
+            task-definition-updated.json > task-definition-final.json
+
+          # 不要なフィールドを削除（register-task-definitionで不要）
+          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
+            task-definition-final.json > task-definition-clean.json
+
+          # 更新後のタスク定義を出力
+          cat task-definition-clean.json
+
+      - name: Register new task definition
+        id: register-task-def
+        run: |
+          NEW_TASK_DEF=$(aws ecs register-task-definition \
+            --cli-input-json file://task-definition-clean.json \
+            --region ${{ env.AWS_REGION }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          echo "task_def_arn=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
+          echo "New task definition registered: $NEW_TASK_DEF"
+
+      - name: Update ECS service
+        run: |
+          aws ecs update-service \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --service ${{ env.ECS_SERVICE }} \
+            --task-definition ${{ steps.register-task-def.outputs.task_def_arn }} \
+            --force-new-deployment \
+            --region ${{ env.AWS_REGION }}
+
+      - name: Wait for service to stabilize
+        run: |
+          echo "Waiting for ECS service to stabilize..."
+          aws ecs wait services-stable \
+            --cluster ${{ env.ECS_CLUSTER }} \
+            --services ${{ env.ECS_SERVICE }} \
+            --region ${{ env.AWS_REGION }}
+          echo "Service update completed successfully!"
+
+      - name: Output deployment info
+        run: |
+          echo "Deployment completed!"
+          echo "Task Definition: ${{ steps.register-task-def.outputs.task_def_arn }}"
+          echo "Service: ${{ env.ECS_SERVICE }}"
+          echo "Cluster: ${{ env.ECS_CLUSTER }}"
