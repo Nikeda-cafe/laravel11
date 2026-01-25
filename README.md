@@ -91,7 +91,126 @@ docker compose run --rm app ./vendor/bin/phpstan analyse
 - Docker がインストールされていること
 - ECR へのアクセス権限があること
 
-### デプロイ手順
+### GitHub Actions による自動デプロイ（ECR）
+
+`.github/workflows/deploy-ecr.yml` により、`main` または `develop` ブランチへのpush時に自動的にECRへイメージをビルド・プッシュします。
+
+#### OIDC認証の設定（推奨）
+
+このワークフローはOIDC（OpenID Connect）を使用してAWSに認証します。アクセスキーを保存する必要がなく、より安全です。
+
+##### 1. AWS側の設定
+
+**1-1. IAM Identity Providerの作成**
+
+GitHubをOIDCプロバイダーとして登録します：
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1 \
+  --region ap-northeast-1
+```
+
+**1-2. IAMロールの作成**
+
+GitHub ActionsからAssumeRoleできるIAMロールを作成します：
+
+```bash
+# 信頼ポリシー（trust-policy.json）
+cat > trust-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::YOUR_ACCOUNT_ID:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:YOUR_GITHUB_ORG/YOUR_REPO_NAME:*"
+        }
+      }
+    }
+  ]
+}
+EOF
+
+# ロールの作成
+aws iam create-role \
+  --role-name GitHubActionsECRRole \
+  --assume-role-policy-document file://trust-policy.json \
+  --region ap-northeast-1
+```
+
+**1-3. IAMポリシーのアタッチ**
+
+ECRへのアクセス権限を持つポリシーをアタッチします：
+
+```bash
+# ポリシードキュメント（ecr-policy.json）
+cat > ecr-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "ecr:GetAuthorizationToken",
+        "ecr:BatchCheckLayerAvailability",
+        "ecr:GetDownloadUrlForLayer",
+        "ecr:BatchGetImage",
+        "ecr:PutImage",
+        "ecr:InitiateLayerUpload",
+        "ecr:UploadLayerPart",
+        "ecr:CompleteLayerUpload",
+        "ecr:DescribeRepositories",
+        "ecr:CreateRepository"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+EOF
+
+# ポリシーの作成とアタッチ
+aws iam put-role-policy \
+  --role-name GitHubActionsECRRole \
+  --policy-name ECRPushPolicy \
+  --policy-document file://ecr-policy.json \
+  --region ap-northeast-1
+```
+
+**1-4. ロールARNの確認**
+
+```bash
+aws iam get-role --role-name GitHubActionsECRRole --query 'Role.Arn' --output text
+```
+
+##### 2. GitHub側の設定
+
+GitHubリポジトリの **Settings → Secrets and variables → Actions** で以下のSecretを設定してください：
+
+- `AWS_ROLE_ARN`: 上記で作成したIAMロールのARN（例: `arn:aws:iam::123456789012:role/GitHubActionsECRRole`）
+
+**注意**: `YOUR_ACCOUNT_ID`、`YOUR_GITHUB_ORG`、`YOUR_REPO_NAME` は実際の値に置き換えてください。
+
+#### ワークフローの動作
+
+- **全ブランチ**: Git hashのshort形式（7文字、例: `a1b2c3d`）をタグとしてECRへpush
+- **手動実行**: GitHub ActionsのUIから任意のタグを指定可能（未指定の場合はGit hashのshort形式を使用）
+
+ECRリポジトリ名は以下の通りです（`.github/workflows/deploy-ecr.yml` の `env` セクションで変更可能）：
+- Laravelアプリ: `laravel-app`
+- nginx: `laravel-nginx`
+
+### 手動デプロイ手順
 
 #### 1. 環境変数の設定
 
