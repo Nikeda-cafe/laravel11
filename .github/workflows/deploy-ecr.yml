@@ -9,22 +9,37 @@ on:
       - 'Dockerfile'
       - 'Dockerfile.nginx'
       - 'docker/**'
-      - '.github/workflows/deploy-ecr.yml'
       - 'app/**'
       - 'config/**'
       - 'routes/**'
+      - 'resources/**'
+      - 'public/**'
+      - '.github/workflows/deploy-ecr.yml'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: '任意のECRタグ（未指定ならGit hash short(7桁)）'
+        required: false
+        type: string
 
 env:
   AWS_REGION: ap-northeast-1
+
+  # ECR repositories
   ECR_REPOSITORY_APP: laravel-app
   ECR_REPOSITORY_NGINX: laravel-nginx
+
+  # ECS
   ECS_CLUSTER: ecs-laravel-cluster
   ECS_SERVICE: ecs-laravel-service
   ECS_TASK_DEFINITION_FAMILY: ecs-laravel-task-definition
 
+  # ECS task definition container names (タスク定義内のcontainerDefinitions[].name)
+  ECS_CONTAINER_NAME_APP: laravel-app
+  ECS_CONTAINER_NAME_NGINX: laravel-nginx
+
 jobs:
-  build-and-push:
+  build-push-deploy:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -34,7 +49,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
@@ -44,152 +59,176 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Set image tag
+      - name: Determine image tag
         id: image-tag
         run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            TAG="${{ github.event.inputs.tag }}"
-            if [ -z "$TAG" ]; then
-              TAG="$SHORT_SHA"
-            fi
+          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
+          TAG_INPUT="${{ github.event.inputs.tag }}"
+          if [ -n "$TAG_INPUT" ]; then
+            TAG="$TAG_INPUT"
           else
             TAG="$SHORT_SHA"
           fi
-          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Using image tag: $TAG"
 
-      - name: Build and push Laravel app image
+      - name: Build and push Laravel app image (tag)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY_APP }}
           IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
         run: |
-          # イメージをビルド
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile .
+          set -euo pipefail
+          APP_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_APP }}:$IMAGE_TAG"
+          echo "Building: $APP_URI_TAG"
+          docker build -t "$APP_URI_TAG" -f Dockerfile .
+          echo "Pushing: $APP_URI_TAG"
+          docker push "$APP_URI_TAG"
 
-          # ECRへpush
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-      - name: Build and push nginx image
+      - name: Build and push nginx image (tag)
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ env.ECR_REPOSITORY_NGINX }}
           IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
         run: |
-          # イメージをビルド
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -f Dockerfile.nginx .
-
-          # ECRへpush
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-
-      - name: Output image URIs
-        id: image-uris
-        run: |
-          APP_IMG="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_APP }}:${{ steps.image-tag.outputs.tag }}"
-          NGINX_IMG="${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_NGINX }}:${{ steps.image-tag.outputs.tag }}"
-          echo "Laravel app image: $APP_IMG"
-          echo "Nginx image: $NGINX_IMG"
-          echo "app_image=$APP_IMG" >> $GITHUB_OUTPUT
-          echo "nginx_image=$NGINX_IMG" >> $GITHUB_OUTPUT
-          echo "image_tag=${{ steps.image-tag.outputs.tag }}" >> $GITHUB_OUTPUT
-
-    outputs:
-      app_image: ${{ steps.image-uris.outputs.app_image }}
-      nginx_image: ${{ steps.image-uris.outputs.nginx_image }}
-      image_tag: ${{ steps.image-uris.outputs.image_tag }}
-
-  deploy-ecs:
-    needs: build-and-push
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      id-token: write
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+          set -euo pipefail
+          NGINX_URI_TAG="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_NGINX }}:$IMAGE_TAG"
+          echo "Building: $NGINX_URI_TAG"
+          docker build -t "$NGINX_URI_TAG" -f Dockerfile.nginx .
+          echo "Pushing: $NGINX_URI_TAG"
+          docker push "$NGINX_URI_TAG"
 
       - name: Install jq
         run: |
           sudo apt-get update
           sudo apt-get install -y jq
 
-      - name: Get latest task definition
+      - name: Resolve pushed image digests (pin by digest)
+        id: image-digests
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ steps.image-tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+
+          APP_DIGEST="$(aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY_APP }}" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          NGINX_DIGEST="$(aws ecr describe-images \
+            --repository-name "${{ env.ECR_REPOSITORY_NGINX }}" \
+            --image-ids imageTag="$IMAGE_TAG" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+
+          if [ -z "$APP_DIGEST" ] || [ "$APP_DIGEST" = "None" ]; then
+            echo "ERROR: Could not resolve app image digest for tag=$IMAGE_TAG"
+            exit 1
+          fi
+          if [ -z "$NGINX_DIGEST" ] || [ "$NGINX_DIGEST" = "None" ]; then
+            echo "ERROR: Could not resolve nginx image digest for tag=$IMAGE_TAG"
+            exit 1
+          fi
+
+          APP_URI_DIGEST="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_APP }}@$APP_DIGEST"
+          NGINX_URI_DIGEST="$ECR_REGISTRY/${{ env.ECR_REPOSITORY_NGINX }}@$NGINX_DIGEST"
+
+          echo "app_image=$APP_URI_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "nginx_image=$NGINX_URI_DIGEST" >> "$GITHUB_OUTPUT"
+          echo "image_tag=$IMAGE_TAG" >> "$GITHUB_OUTPUT"
+
+          echo "Pinned images:"
+          echo "  app:   $APP_URI_DIGEST"
+          echo "  nginx: $NGINX_URI_DIGEST"
+
+      - name: Fetch current ECS task definition
         id: task-def
         run: |
-          TASK_DEF=$(aws ecs describe-task-definition \
-            --task-definition ${{ env.ECS_TASK_DEFINITION_FAMILY }} \
+          set -euo pipefail
+          aws ecs describe-task-definition \
+            --task-definition "${{ env.ECS_TASK_DEFINITION_FAMILY }}" \
             --query 'taskDefinition' \
-            --region ${{ env.AWS_REGION }} || echo "{}")
-          echo "task_def<<EOF" >> $GITHUB_OUTPUT
-          echo "$TASK_DEF" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+            --output json > task-definition.json
 
-      - name: Update task definition with new images
-        id: update-task-def
+          echo "Current task definition images:"
+          jq '.containerDefinitions[] | {name: .name, image: .image}' task-definition.json
+
+      - name: Create updated task definition (replace container images)
         env:
-          APP_IMAGE: ${{ needs.build-and-push.outputs.app_image }}
-          NGINX_IMAGE: ${{ needs.build-and-push.outputs.nginx_image }}
+          APP_IMAGE: ${{ steps.image-digests.outputs.app_image }}
+          NGINX_IMAGE: ${{ steps.image-digests.outputs.nginx_image }}
         run: |
-          # タスク定義をJSONファイルに保存
-          echo '${{ steps.task-def.outputs.task_def }}' > task-definition.json
+          set -euo pipefail
 
-          # jqを使ってイメージURIを更新
-          # appコンテナのイメージを更新
-          jq --arg img "$APP_IMAGE" \
-            '.containerDefinitions[] |= if .name == "app" then .image = $img else . end' \
-            task-definition.json > task-definition-updated.json
+          # コンテナ名が存在することを検証（名前不一致だと更新されないため）
+          APP_EXISTS="$(jq --arg n "${{ env.ECS_CONTAINER_NAME_APP }}" '[.containerDefinitions[].name] | index($n)' task-definition.json)"
+          NGINX_EXISTS="$(jq --arg n "${{ env.ECS_CONTAINER_NAME_NGINX }}" '[.containerDefinitions[].name] | index($n)' task-definition.json)"
 
-          # nginxコンテナのイメージを更新
-          jq --arg img "$NGINX_IMAGE" \
-            '.containerDefinitions[] |= if .name == "nginx" then .image = $img else . end' \
-            task-definition-updated.json > task-definition-final.json
+          if [ "$APP_EXISTS" = "null" ]; then
+            echo "ERROR: container name not found in task definition: ${{ env.ECS_CONTAINER_NAME_APP }}"
+            jq '.containerDefinitions[] | .name' task-definition.json
+            exit 1
+          fi
+          if [ "$NGINX_EXISTS" = "null" ]; then
+            echo "ERROR: container name not found in task definition: ${{ env.ECS_CONTAINER_NAME_NGINX }}"
+            jq '.containerDefinitions[] | .name' task-definition.json
+            exit 1
+          fi
 
-          # 不要なフィールドを削除（register-task-definitionで不要）
-          jq 'del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)' \
-            task-definition-final.json > task-definition-clean.json
+          jq --arg appName "${{ env.ECS_CONTAINER_NAME_APP }}" --arg appImg "$APP_IMAGE" \
+             --arg nginxName "${{ env.ECS_CONTAINER_NAME_NGINX }}" --arg nginxImg "$NGINX_IMAGE" \
+             '.containerDefinitions |= map(
+                if .name == $appName then .image = $appImg
+                elif .name == $nginxName then .image = $nginxImg
+                else .
+                end
+              )' task-definition.json > task-definition-updated.json
 
-          # 更新後のタスク定義を出力
-          cat task-definition-clean.json
+          # register-task-definition で不要な読み取り専用フィールドを削除
+          jq 'del(
+                .taskDefinitionArn,
+                .revision,
+                .status,
+                .requiresAttributes,
+                .compatibilities,
+                .registeredAt,
+                .registeredBy
+              )' task-definition-updated.json > task-definition-clean.json
+
+          echo "Updated task definition images:"
+          jq '.containerDefinitions[] | {name: .name, image: .image}' task-definition-clean.json
 
       - name: Register new task definition
-        id: register-task-def
+        id: register
         run: |
-          NEW_TASK_DEF=$(aws ecs register-task-definition \
+          set -euo pipefail
+          NEW_TD_ARN="$(aws ecs register-task-definition \
             --cli-input-json file://task-definition-clean.json \
-            --region ${{ env.AWS_REGION }} \
             --query 'taskDefinition.taskDefinitionArn' \
-            --output text)
-          echo "task_def_arn=$NEW_TASK_DEF" >> $GITHUB_OUTPUT
-          echo "New task definition registered: $NEW_TASK_DEF"
+            --output text)"
+          echo "task_definition_arn=$NEW_TD_ARN" >> "$GITHUB_OUTPUT"
+          echo "Registered: $NEW_TD_ARN"
 
-      - name: Update ECS service
+      - name: Update ECS service (rolling deployment)
         run: |
+          set -euo pipefail
           aws ecs update-service \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --service ${{ env.ECS_SERVICE }} \
-            --task-definition ${{ steps.register-task-def.outputs.task_def_arn }} \
-            --force-new-deployment \
-            --region ${{ env.AWS_REGION }}
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --service "${{ env.ECS_SERVICE }}" \
+            --task-definition "${{ steps.register.outputs.task_definition_arn }}" \
+            --force-new-deployment
 
-      - name: Wait for service to stabilize
+      - name: Wait for service stable
         run: |
-          echo "Waiting for ECS service to stabilize..."
+          set -euo pipefail
           aws ecs wait services-stable \
-            --cluster ${{ env.ECS_CLUSTER }} \
-            --services ${{ env.ECS_SERVICE }} \
-            --region ${{ env.AWS_REGION }}
-          echo "Service update completed successfully!"
+            --cluster "${{ env.ECS_CLUSTER }}" \
+            --services "${{ env.ECS_SERVICE }}"
 
-      - name: Output deployment info
+      - name: Summary
         run: |
-          echo "Deployment completed!"
-          echo "Task Definition: ${{ steps.register-task-def.outputs.task_def_arn }}"
-          echo "Service: ${{ env.ECS_SERVICE }}"
-          echo "Cluster: ${{ env.ECS_CLUSTER }}"
+          echo "Deployment completed."
+          echo "  tag:  ${{ steps.image-digests.outputs.image_tag }}"
+          echo "  app:  ${{ steps.image-digests.outputs.app_image }}"
+          echo "  nginx:${{ steps.image-digests.outputs.nginx_image }}"
+          echo "  task: ${{ steps.register.outputs.task_definition_arn }}"
