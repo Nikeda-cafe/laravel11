@@ -18,7 +18,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: '任意のECRタグ（未指定ならGit hash short(7桁)）'
+        description: '任意のECRタグ（未指定ならlatest）'
         required: false
         type: string
 
@@ -30,9 +30,9 @@ env:
   ECR_REPOSITORY_NGINX: laravel-nginx
 
   # ECS
-  ECS_CLUSTER: ecs-laravel-cluster
-  ECS_SERVICE: ecs-laravel-service
-  ECS_TASK_DEFINITION_FAMILY: ecs-laravel-task-definition
+  ECS_CLUSTER: dev-laravel-app-cluster
+  ECS_SERVICE: dev-laravel-app-service
+  ECS_TASK_DEFINITION_FAMILY: dev-laravel-app
 
   # ECS task definition container names (タスク定義内のcontainerDefinitions[].name)
   ECS_CONTAINER_NAME_APP: laravel-app
@@ -63,12 +63,11 @@ jobs:
       - name: Determine image tag
         id: image-tag
         run: |
-          SHORT_SHA="$(echo "${{ github.sha }}" | cut -c1-7)"
           TAG_INPUT="${{ github.event.inputs.tag }}"
           if [ -n "$TAG_INPUT" ]; then
             TAG="$TAG_INPUT"
           else
-            TAG="$SHORT_SHA"
+            TAG="latest"
           fi
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "Using image tag: $TAG"
