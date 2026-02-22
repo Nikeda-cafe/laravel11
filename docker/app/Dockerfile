@@ -17,8 +17,8 @@ RUN apt-get update \
         nodejs \
         npm \
     && docker-php-ext-install pdo_mysql bcmath pcntl \
-    && pecl install xdebug \
-    && docker-php-ext-enable xdebug \
+    && pecl install redis xdebug \
+    && docker-php-ext-enable redis xdebug \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=composer:2 /usr/bin/composer /usr/bin/composer

@@ -16,6 +16,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      valkey:
+        condition: service_healthy
     networks:
       - backend-network
 
@@ -28,6 +30,20 @@ services:
       - ./docker/nginx/default.conf:/etc/nginx/conf.d/default.conf
     depends_on:
       - app
+    networks:
+      - backend-network
+
+  valkey:
+    image: valkey/valkey:8-alpine
+    ports:
+      - "${VALKEY_PORT:-6379}:6379"
+    volumes:
+      - ./docker/valkey/data:/data
+    healthcheck:
+      test: ["CMD", "valkey-cli", "ping"]
+      interval: 5s
+      retries: 5
+      timeout: 5s
     networks:
       - backend-network
 

@@ -73,7 +73,9 @@ RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
     pcntl \
     zip \
     gd \
-    opcache
+    opcache \
+    && pecl install redis \
+    && docker-php-ext-enable redis
 
 # 開発用パッケージを削除（イメージサイズを小さくする）
 RUN apk del \
