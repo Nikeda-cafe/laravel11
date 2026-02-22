@@ -48,6 +48,7 @@ RUN npm ci && npm run build && rm -rf node_modules
 FROM php:8.2-fpm-alpine
 
 # 必要なパッケージのインストール（開発用パッケージも一時的に必要）
+# autoconf: pecl install で phpize が使用するため必須
 RUN apk add --no-cache \
     libzip \
     libzip-dev \
@@ -63,7 +64,8 @@ RUN apk add --no-cache \
     libjpeg-turbo \
     libjpeg-turbo-dev \
     pkgconfig \
-    build-base
+    build-base \
+    autoconf
 
 # PHP拡張機能のインストール
 RUN docker-php-ext-configure gd --with-freetype --with-jpeg \
@@ -86,7 +88,8 @@ RUN apk del \
     freetype-dev \
     libjpeg-turbo-dev \
     pkgconfig \
-    build-base
+    build-base \
+    autoconf
 
 # OPcache設定の最適化
 RUN echo "opcache.enable=1" >> /usr/local/etc/php/conf.d/opcache.ini \
